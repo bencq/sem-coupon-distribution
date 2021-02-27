@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	sm    *http.ServeMux
-	redis redigo.Conn
+	sm          *http.ServeMux
+	redisClient *redigo.Pool
 )
 
 const ()
@@ -97,7 +97,7 @@ func splitAmount(totalAmount int64, UserLen int64) ([]int64, []int64) {
 	restAmount := totalAmount
 	for restAmount > 0 {
 		curAmount := rand.Int63n(totalAmount) + 1
-		if curAmount > restAmount {
+		if curAmount > restAmount || len(amount_list) == int(splitUserCnt-1) {
 			curAmount = restAmount
 		}
 		amount_list = append(amount_list, curAmount)
@@ -113,6 +113,9 @@ func initServerMux() {
 	sm.HandleFunc("/coupon-batches", func(resp http.ResponseWriter, req *http.Request) {
 		if req.Method == "GET" {
 			//查看优惠券列表
+
+			redis := redisClient.Get()
+			defer redis.Close()
 
 			reply, err := redigo.Values(redis.Do("sort", "Batch", "get", "Batch:*->id", "get", "Batch:*->name", "get", "Batch:*->value", "get", "Batch:*->amount", "get", "Batch:*->issued"))
 			if err != nil {
@@ -145,6 +148,9 @@ func initServerMux() {
 		} else if req.Method == "POST" {
 			//添加新的优惠券批次
 
+			redis := redisClient.Get()
+			defer redis.Close()
+
 			bodyData, err := ioutil.ReadAll(req.Body)
 			if err != nil {
 				fmt.Println("err", err)
@@ -160,12 +166,15 @@ func initServerMux() {
 			}
 			batch.Id = batchLen
 			batch.Issued = false
-			redis.Do("rpush", "Batch", batchLen)
-			redis.Do("hmset", "Batch:"+strconv.Itoa(int(batchLen)), "id", batch.Id, "name", batch.Name, "value", batch.Value, "amount", batch.Amount, "issued", batch.Issued)
+			redis.Do("rpush", "Batch", batch.Id)
+			redis.Do("hmset", "Batch:"+strconv.Itoa(int(batch.Id)), "id", batch.Id, "name", batch.Name, "value", batch.Value, "amount", batch.Amount, "issued", batch.Issued)
 			resp.WriteHeader(200)
 
 		} else if req.Method == "PATCH" {
 			// 发放所有优惠券
+
+			redis := redisClient.Get()
+			defer redis.Close()
 
 			reply, err := redigo.Values(redis.Do("sort", "Batch", "get", "Batch:*->id", "get", "Batch:*->name", "get", "Batch:*->value", "get", "Batch:*->amount", "get", "Batch:*->issued"))
 			if err != nil {
@@ -213,7 +222,7 @@ func initServerMux() {
 							Amount:       amount_list[userInd],
 							AcquiredTime: time.Now().Unix(),
 						}
-						redis.Do("rpush", "Own", OwnLen)
+						redis.Do("rpush", "Own", own.Id)
 						redis.Do("hmset", "Own:"+strconv.Itoa(int(own.Id)), "id", own.Id, "userId", own.UserId, "batchId", own.BatchId, "amount", own.Amount, "acquiredTime", own.AcquiredTime)
 					}
 					redis.Do("hmset", "Batch:"+strconv.Itoa(int(batch.Id)), "issued", 1)
@@ -230,6 +239,10 @@ func initServerMux() {
 		if req.Method == "PATCH" {
 			// 发放单个批次的优惠券
 			// fmt.Println(req.RequestURI)
+
+			redis := redisClient.Get()
+			defer redis.Close()
+
 			batchId := strings.Split(req.URL.Path, "/")[2]
 			UserLen, err := redigo.Int64(redis.Do("LLEN", "User"))
 			if err != nil {
@@ -274,7 +287,7 @@ func initServerMux() {
 					Amount:       amount_list[userInd],
 					AcquiredTime: time.Now().Unix(),
 				}
-				redis.Do("rpush", "Own", OwnLen)
+				redis.Do("rpush", "Own", own.Id)
 				redis.Do("hmset", "Own:"+strconv.Itoa(int(own.Id)), "id", own.Id, "userId", own.UserId, "batchId", own.BatchId, "amount", own.Amount, "acquiredTime", own.AcquiredTime)
 			}
 			redis.Do("hmset", "Batch:"+batchId, "issued", 1)
@@ -286,6 +299,10 @@ func initServerMux() {
 	sm.HandleFunc("/users", func(resp http.ResponseWriter, req *http.Request) {
 		if req.Method == "GET" {
 			// 查询用户
+
+			redis := redisClient.Get()
+			defer redis.Close()
+
 			reply, err := redigo.Int64s(redis.Do("sort", "Own", "get", "Own:*->id", "get", "Own:*->userId", "get", "Own:*->batchId", "get", "Own:*->amount", "get", "Own:*->acquiredTime"))
 			if err != nil {
 				fmt.Println("err", err)
@@ -357,6 +374,31 @@ func initServerMux() {
 			}
 			jsonData, _ := json.Marshal(userSucResp)
 			resp.Write(jsonData)
+		} else if req.Method == "POST" {
+
+			redis := redisClient.Get()
+			defer redis.Close()
+
+			bodyData, err := ioutil.ReadAll(req.Body)
+			if err != nil {
+				fmt.Println("err", err)
+			}
+			var user User
+			err = json.Unmarshal(bodyData, &user)
+			if err != nil {
+				fmt.Println("err", err)
+			}
+
+			UserLen, err := redigo.Int64(redis.Do("LLEN", "User"))
+			if err != nil {
+				fmt.Println("err", err)
+			}
+
+			user.Id = UserLen
+			redis.Do("rpush", "User", user.Id)
+			redis.Do("hmset", "User:"+strconv.Itoa(int(user.Id)), "id", user.Id, "nickname", user.Nickname, "phoneNumber", user.PhoneNumber)
+			resp.WriteHeader(200)
+
 		}
 
 	})
@@ -396,9 +438,19 @@ func initServerMux() {
 func initRedigoConn() error {
 	redisHost := "127.0.0.1"
 	redisPort := "6379"
-	var err error
-	redis, err = redigo.Dial("tcp", redisHost+":"+redisPort)
-	return err
+	redisClient = &redigo.Pool{
+		MaxIdle:     1,
+		MaxActive:   10,
+		IdleTimeout: 180 * time.Second,
+		Dial: func() (redigo.Conn, error) {
+			c, err := redigo.Dial("tcp", redisHost+":"+redisPort)
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
+	}
+	return nil
 }
 
 func main() {
@@ -407,7 +459,7 @@ func main() {
 		fmt.Println("err", err)
 		return
 	}
-	defer redis.Close()
+	// defer redis.Close()
 	fmt.Println("dialed successfully")
 	initServerMux()
 
